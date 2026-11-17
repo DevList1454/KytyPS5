@@ -68,22 +68,43 @@ public:
 		m_owner.store(0, std::memory_order_relaxed);
 		m_lock.clear(std::memory_order_release);
 	}
+	// lock() that never waits: false when another thread holds it (a waiter that must not wait
+	// for the holder, a weave worker inside its draw).
+	[[nodiscard]] bool try_lock() noexcept {
+		const auto thread = CurrentThread();
+		if (m_owner.load(std::memory_order_relaxed) == thread) {
+			EXIT("recursive region tracking lock\n");
+		}
+		if (m_lock.test(std::memory_order_relaxed) || m_lock.test_and_set(std::memory_order_acquire)) {
+			return false;
+		}
+		m_owner.store(thread, std::memory_order_relaxed);
+		m_seq.store(m_seq.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_release);
+		return true;
+	}
 	[[nodiscard]] bool OwnedByCurrentThread() const noexcept { return m_owner.load(std::memory_order_relaxed) == CurrentThread(); }
 	// A read of state only holders of this lock write, without taking it: valid when no holder
 	// was inside while it ran (the sequence even and unchanged), else done again under the lock.
 	// The query then costs no locked instruction and leaves the lock's line to the writers.
 	template <typename Read>
 	auto ReadShared(Read&& read) {
-		const auto before = m_seq.load(std::memory_order_acquire);
-		if ((before & 1u) == 0) {
-			auto result = read();
-			std::atomic_thread_fence(std::memory_order_acquire);
-			if (m_seq.load(std::memory_order_relaxed) == before) return result;
-		}
+		if (decltype(read()) result {}; TryReadShared(read, result)) return result;
 		lock();
 		auto result = read();
 		unlock();
 		return result;
+	}
+	// ReadShared's read without the lock: false (`result` untouched) when a holder was inside.
+	template <typename Read, typename Result>
+	[[nodiscard]] bool TryReadShared(Read&& read, Result& result) {
+		const auto before = m_seq.load(std::memory_order_acquire);
+		if ((before & 1u) != 0) return false;
+		auto value = read();
+		std::atomic_thread_fence(std::memory_order_acquire);
+		if (m_seq.load(std::memory_order_relaxed) != before) return false;
+		result = value;
+		return true;
 	}
 
 	static void YieldCpu() noexcept {

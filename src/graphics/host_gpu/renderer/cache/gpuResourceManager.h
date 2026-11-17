@@ -14,7 +14,9 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <span>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -85,6 +87,18 @@ public:
 	// Whether memory in [vaddr, vaddr + size) was unmapped after mapping epoch `epoch` (by 16 KiB
 	// granule). GPU thread, as UnmapMemory.
 	[[nodiscard]] bool UnmappedSince(uint64_t epoch, uint64_t vaddr, uint64_t size) const noexcept;
+	// The weave's (GPU thread): any of `sorted` ([begin, end) ranges, ascending by begin, disjoint) unmapped, or mapped
+	// within a 16 KiB granule of it, after mapping epoch `epoch`, in one call (each unmap leaf looked up once, each map
+	// since matched by a search). Maps past the map log's reach count as moved.
+	[[nodiscard]] bool MappingMovedSince(uint64_t                                       epoch,
+	                                     std::span<const std::pair<uint64_t, uint64_t>> sorted) const noexcept;
+	// Its second half: any of `sorted` mapped, or a map within a 16 KiB granule of it, after `epoch`, by the log of the
+	// latest maps (past its reach: true).
+	[[nodiscard]] bool MappedSinceLogged(uint64_t                                       epoch,
+	                                     std::span<const std::pair<uint64_t, uint64_t>> sorted) const noexcept;
+	// UnmappedSince's question from the log of the latest unmaps, by overlap at 16 KiB granules: 0 none, 1 one did, 2
+	// the log doesn't reach back to `epoch` (UnmappedSince answers then).
+	[[nodiscard]] int UnmappedSinceLogged(uint64_t epoch, uint64_t vaddr, uint64_t size) const noexcept;
 
 	bool PrepareBdaReadRanges(std::span<const GuestRange> ranges);
 	// After each completed submission: its shaders' fault records and the image downloads.
