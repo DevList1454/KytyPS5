@@ -896,6 +896,7 @@ uint64_t NativeXprPairKey(const std::vector<uint32_t>& key) {
 
 RenderExecutor::NativeXprCache& RenderExecutor::NativeXprState() {
 	if (!m_native_xpr) {
+		const Weave::Hold hold; // (a weave worker reads the pointer)
 		m_native_xpr         = std::make_shared<NativeXprCache>();
 		m_native_xpr->device = m_context.GetGraphics().device;
 	}
@@ -1125,9 +1126,12 @@ bool RenderExecutor::NativeXprSweepStates(NativeXprCache& cache, uint64_t frame)
 	const auto write = CatalogWrite();
 	// (Under the lock: a translation counted after this reads the catalog after the sweep, and sees its epoch.)
 	if (kyty_local_speculations_live.load(std::memory_order_seq_cst) != 0) return false;
+	const Weave::Hold hold; // (the draw states a weave worker finds states in)
 	const size_t before = cache.states.size();
 	std::erase_if(cache.states, [&](const auto& item) {
-		return item.second->UsedFrame() + NativeXprCache::StateKeepFrames < frame;
+		if (item.second->UsedFrame() + NativeXprCache::StateKeepFrames >= frame) return false;
+		if (Weave::Active()) Weave::NoteFreed(item.second.get());
+		return true;
 	});
 	if (cache.states.size() == before) return true;
 	cache.emit           = {};
@@ -1813,10 +1817,11 @@ bool RenderExecutor::NativeXprRebind(NativeXprRecord&                           
 
 // A draw state's dynamic state into `vk_buffer`: all of it in another command buffer or generation (what any other
 // path recorded is unknown), else the values that differ from what the table and native emissions recorded there.
-// (A state change recorded all ~13 values, most unchanged: ~2% of the GPU thread on the 1-1 walk, 0.8% now.)
-void RenderExecutor::NativeXprEmitDynamic(NativeXprCache& cache, vk::CommandBuffer vk_buffer,
-                                          const NativeXprDrawState& draw_state, bool same_command) {
-	auto&      emit = cache.emit;
+// (A state change recorded all ~13 values, most unchanged: ~2% of the GPU thread on the 1-1 walk, 0.8% now.) `emit`:
+// what the emissions left bound there, the native cache's, or a weave worker's own for its strand's buffer.
+template <typename Emit, typename State>
+static void NativeXprEmitDynamicInto(Emit& emit, vk::CommandBuffer vk_buffer, const State& draw_state,
+                                     bool same_command) {
 	const bool diff = same_command && emit.dynamic_held;
 	if (!diff) emit.dynamic = draw_state.resolved;
 	EmitGraphicsDynamicParams(vk_buffer, draw_state.resolved, diff ? &emit.dynamic : nullptr, VULKAN_HPP_DEFAULT_DISPATCHER);
@@ -1830,6 +1835,10 @@ void RenderExecutor::NativeXprEmitDynamic(NativeXprCache& cache, vk::CommandBuff
 	} else if (!diff) {
 		emit.feedback_held = false;
 	}
+}
+void RenderExecutor::NativeXprEmitDynamic(NativeXprCache& cache, vk::CommandBuffer vk_buffer,
+                                          const NativeXprDrawState& draw_state, bool same_command) {
+	NativeXprEmitDynamicInto(cache.emit, vk_buffer, draw_state, same_command);
 }
 
 // The draw state under `state_key`: the render targets as this draw left them (a reopened rendering loads),
@@ -1890,8 +1899,10 @@ void RenderExecutor::NativeXprCaptureState(CommandBuffer& buffer, const DrawRend
 	// Entries stay at their address (emission tracking compares pointers); a
 	// replaced state must be emitted again.
 	const auto write = CatalogWrite();
+	const Weave::Hold hold; // (the draw states a weave worker finds states in; one replaced in place)
 	auto&      slot  = cache.states[state_key];
 	if (!slot) slot = std::make_unique<NativeXprDrawState>();
+	else if (Weave::Active()) Weave::NoteFreed(slot.get()); // (replaced in place: what a weave worker kept of it goes)
 	*slot = std::move(draw_state);
 	slot->Use(m_context.FrameNumber());
 	if (cache.emit.state == slot.get()) cache.emit.state = nullptr;
@@ -3168,6 +3179,19 @@ struct RenderExecutor::NativeXprDirect {
 	uint32_t            first_instance = 0;
 };
 
+// A target's image gone (released, another object in its slot, unregistered) or to be bound again: why, else null.
+template <typename Image, typename Target>
+[[nodiscard]] static const char* NativeXprTargetGone(const Image* image, const Target& target) {
+	if (image == nullptr || image->serial != target.serial || !image->registered) return "table: target released";
+	if (image->binding.needs_rebind) return "table: target rebind";
+	return nullptr;
+}
+// A target NativeXprEmitTargets leaves as it is: its whole image in the target's layout, in one state.
+template <typename Image, typename Target>
+[[nodiscard]] static bool NativeXprTargetInPlace(const Image& image, const Target& target) {
+	return image.CurrentState().layout == target.layout && image.backing.subresource_states.empty();
+}
+
 // What the normal path's target acquisition establishes must still hold: the image is registered,
 // GPU-owned (so CPU reads download it) and CPU-clean, and no fast clear is pending in its metadata.
 // Otherwise the normal path acquires. Then the targets in the state's layouts.
@@ -3178,9 +3202,7 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 	auto*      spec       = Spec::Current();
 	for (const auto& target: draw_state.targets) {
 		auto* image = textures.m_slot_images.try_get(target.id);
-		if (image == nullptr || image->serial != target.serial || !image->registered)
-			return Spec::Refuse("table: target released"), false;
-		if (image->binding.needs_rebind) return Spec::Refuse("table: target rebind"), false;
+		if (const char* gone = NativeXprTargetGone(image, target)) return Spec::Refuse(gone), false;
 		// spec_depth_layers2: a layered depth target's draw the checks below would refuse ('table: target download', 'table:
 		// cleared target') is left to the commit instead, one entry per draw, the draw recorded loading (the captured
 		// state's clears are zeroed). THE RULE THAT KEEPS IT EXACT: the commit (Speculation::Before) makes, for this draw and
@@ -3322,7 +3344,7 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 		// speculation's commit that left a layer elsewhere (rendering to layer 0 of four left the image's layout the
 		// target's, layers 1-3 sampled), the target's own subresources decide; a speculation's always do: it does not
 		// see its holes' transitions.)
-		if (spec != nullptr || image.CurrentState().layout != target.layout || !image.backing.subresource_states.empty()) {
+		if (spec != nullptr || !NativeXprTargetInPlace(image, target)) {
 			// (A target the table set's shaders sample: with their access, which TableTransit gives it next, the whole
 			// image's; else that transition would follow this one at every draw, a render pass break each.)
 			const auto read = reading != nullptr ? TableTargetRead(*reading, target.id) : vk::AccessFlags2 {};
@@ -3333,22 +3355,46 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 	return true;
 }
 
+// KYTY_FG_HUDLESS: the game's composite into the flip image is drawn on the normal path (frame-gen-hudless.h).
+template <typename State>
+[[nodiscard]] static bool NativeXprHudlessTarget(const State& draw_state) {
+	if (FrameGen::HudlessCapturing())
+		for (const auto& target: draw_state.targets)
+			if (FrameGen::IsFlipTarget(target.requested.data.address)) return true;
+	return false;
+}
+
 // A deleted target image took the state's attachment views along (its slot may hold another image by
 // now), and a newer image with the same backing as a target is what the registers now select: the
 // normal path captures the state again.
 bool RenderExecutor::NativeXprTargetsCurrent(const NativeXprDrawState& draw_state) {
-	// KYTY_FG_HUDLESS: the game's composite into the flip image is drawn on the normal path (frame-gen-hudless.h).
-	if (FrameGen::HudlessCapturing())
-		for (const auto& target: draw_state.targets)
-			if (FrameGen::IsFlipTarget(target.requested.data.address)) return false;
+	if (NativeXprHudlessTarget(draw_state)) return false;
 	auto&      textures = m_context.GetTextureCache();
 	const auto checked  = textures.ResolutionEpoch();
 	// (Every table draw asked: a slot lookup and a cold image object per target, ~28K a frame at 1-1.)
 	if (draw_state.targets_checked == checked) return true;
+	NativeXprTargetsProof proof;
+	if (!NativeXprTargetsProve(draw_state, proof, true)) return false;
+	draw_state.targets_span_begin = proof.span_begin;
+	draw_state.targets_span_end   = proof.span_end;
+	draw_state.targets_epoch      = proof.epoch;
+	draw_state.targets_erased     = proof.erased;
+	draw_state.targets_checked    = proof.checked;
+	return true;
+}
+
+// The proof itself reads and writes nothing shared. Images are registered, unregistered and their slots erased on the
+// GPU thread only (a slot a weave worker may be using is kept until it is not, Weave::HoldsSlot, and a worker asks
+// nothing of a retiring one, Weave::ImageRetiring); the texture cache's registration log, which the shortcut reads, is
+// the GPU thread's too (it appends to it and erases from it).
+bool RenderExecutor::NativeXprTargetsProve(const NativeXprDrawState& draw_state, NativeXprTargetsProof& proof,
+                                           bool shortcut_allowed) {
+	auto&      textures = m_context.GetTextureCache();
+	const auto checked  = textures.ResolutionEpoch();
 	// (A live id is the same object: an erase moves its slot's generation, which the id names. The image itself, a cold
 	// line per target, is not read; nor the slots while no image was erased since the last check.)
 	const auto mode     = kyty_local_targets_shortcut.load(std::memory_order_relaxed);
-	const bool shortcut = mode != 0;
+	const bool shortcut = mode != 0 && shortcut_allowed;
 	const auto erased   = textures.EraseEpoch();
 	const auto mismatch = [&](const char* what) {
 		static std::atomic<uint32_t> reports {0};
@@ -3365,45 +3411,64 @@ bool RenderExecutor::NativeXprTargetsCurrent(const NativeXprDrawState& draw_stat
 				return false;
 			}
 	}
+	auto epoch      = draw_state.targets_epoch;
+	auto span_begin = draw_state.targets_span_begin;
+	auto span_end   = draw_state.targets_span_end;
 	// No registration over the targets' span since they were proven (the log's): each target's first page saw none,
 	// as IsTargetCurrent would find. (The epoch moves a few times a frame somewhere; each state used after it read its
 	// targets and their pages' stamps, ~1% of the render thread at Latria.)
-	if (shortcut && draw_state.targets_epoch != 0 && draw_state.targets_epoch != textures.ResolutionEpoch()) {
-		if (draw_state.targets_span_end == 0 && !draw_state.targets.empty()) {
-			draw_state.targets_span_begin = UINT64_MAX;
+	if (shortcut && epoch != 0 && epoch != textures.ResolutionEpoch()) {
+		if (span_end == 0 && !draw_state.targets.empty()) {
+			span_begin = UINT64_MAX;
 			for (const auto& target: draw_state.targets) {
-				draw_state.targets_span_begin = std::min(draw_state.targets_span_begin, target.requested.data.address);
-				draw_state.targets_span_end   = std::max(draw_state.targets_span_end, target.requested.data.address + 1);
+				span_begin = std::min(span_begin, target.requested.data.address);
+				span_end   = std::max(span_end, target.requested.data.address + 1);
 			}
 		}
 		bool known = false;
-		if (draw_state.targets_span_end > draw_state.targets_span_begin &&
-		    !textures.RegistrationsOverlapSince(draw_state.targets_span_begin,
-		                                        draw_state.targets_span_end - draw_state.targets_span_begin,
-		                                        draw_state.targets_epoch, known) &&
-		    known) {
+		if (span_end > span_begin &&
+		    !textures.RegistrationsOverlapSince(span_begin, span_end - span_begin, epoch, known) && known) {
 			if (mode == 2)
 				for (const auto& target: draw_state.targets) {
-					auto epoch = draw_state.targets_epoch;
-					if (!textures.IsTargetCurrent(target.id, target.requested, epoch)) {
+					auto target_epoch = epoch;
+					if (!textures.IsTargetCurrent(target.id, target.requested, target_epoch)) {
 						mismatch("a target not current with no registration over the span since");
 						return false;
 					}
 				}
-			draw_state.targets_epoch = checked;
+			epoch = checked;
 		}
 	}
-	if (draw_state.targets_epoch != textures.ResolutionEpoch()) {
+	if (epoch != textures.ResolutionEpoch()) {
 		uint64_t proven = UINT64_MAX;
 		for (const auto& target: draw_state.targets) {
-			auto epoch = draw_state.targets_epoch;
-			if (!textures.IsTargetCurrent(target.id, target.requested, epoch)) return false;
-			proven = std::min(proven, epoch);
+			auto target_epoch = epoch;
+			if (!textures.IsTargetCurrent(target.id, target.requested, target_epoch)) return false;
+			proven = std::min(proven, target_epoch);
 		}
-		draw_state.targets_epoch = proven != UINT64_MAX ? proven : textures.ResolutionEpoch();
+		epoch = proven != UINT64_MAX ? proven : textures.ResolutionEpoch();
 	}
-	draw_state.targets_erased  = erased;
-	draw_state.targets_checked = checked;
+	proof = {.epoch = epoch, .erased = erased, .checked = checked, .span_begin = span_begin, .span_end = span_end};
+	return true;
+}
+
+// (Read only, off the GPU thread, which acquires and transits targets as it records: each image's barrier state is
+// read under its state lock. A clear pending in a target's metadata since the state's last emission, which
+// NativeXprEmitTargets would make first, is asked as it asks; a weave worker asks it under the texture cache's lock,
+// never waiting for it (IsMetaCleared), and before any state lock.)
+bool RenderExecutor::NativeXprTargetsPlaced(const NativeXprDrawState& draw_state) const {
+	auto&      textures   = m_context.GetTextureCache();
+	const auto meta_epoch = textures.MetaEpoch();
+	for (const auto& target: draw_state.targets) {
+		const auto* image = textures.m_slot_images.try_get(target.id);
+		if (NativeXprTargetGone(image, target) != nullptr || !image->SafeToDownload()) return false;
+		if (target.metadata != 0 && draw_state.meta_epoch != meta_epoch &&
+		    textures.IsMetaCleared(target.metadata, target.slice, nullptr, nullptr,
+		                           target.requested.metadata.kind == ImageMetadataKind::Dcc))
+			return false;
+		const Image::StateLock lock(*image);
+		if (!NativeXprTargetInPlace(*image, target)) return false;
+	}
 	return true;
 }
 
