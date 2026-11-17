@@ -3358,8 +3358,11 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 			return;
 		}
 		CopyGuestMemory(dst_vaddr, src_vaddr, size);
+		// (While workers run: the copy this thread made, which the weave compares with the reader's record of it.)
+		if (Weave::Active()) Weave::t_copy_done = {.dst = dst_vaddr, .src = src_vaddr, .bytes = size, .path = 1};
 		return;
 	}
+	if (Weave::Active()) Weave::t_copy_done = {.dst = dst_vaddr, .src = src_vaddr, .bytes = size, .path = 2};
 
 	auto& command = m_scheduler.Current();
 	if (dst_memory) {
@@ -3419,7 +3422,9 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 			    (Libs::LibKernel::Memory::TryWriteCpuBacking(address, from, bytes) ||
 			     Libs::LibKernel::Memory::TryWriteBacking(address, from, bytes))) {
 				parts.Note();
-				if (Scout::Running()) Scout::NoteHostWrite(address, bytes);
+				// (A linear copy's write, so noted: the weave's ring test passes over it for a parcel that read through
+				// the copy.)
+				if (Scout::Running()) Scout::NoteHostWrite(address, bytes, false, /*copy=*/true);
 				return;
 			}
 			// (Memory the backing view does not hold: written through the guest's view, unprotected first.)
@@ -3430,7 +3435,7 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 		m_memory_tracker.NoteHostWrite(address, bytes);
 		std::memcpy(reinterpret_cast<void*>(address), from, bytes);
 		parts.Note();
-		if (Scout::Running()) Scout::NoteHostWrite(address, bytes);
+		if (Scout::Running()) Scout::NoteHostWrite(address, bytes, false, /*copy=*/true);
 	};
 	// Which destination pages differ: compared on helper threads too when the copy is large (the 4 MiB copy the culling
 	// chain makes every frame, on the frame's critical path: 0.39 ms on this thread alone, 0.24 ms shared at Latria).
