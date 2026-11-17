@@ -442,6 +442,22 @@ static bool PlanEvictionEnabled() {
 	return enabled;
 }
 
+// KYTY_PLAN_READ=1 (0, the default, reads as before): the render thread's plan read made first and through a handle of
+// its own. EnsurePlan reads the source's plan and restores it before it hands the plans used around it to the compile
+// workers, so its read isn't queued behind theirs. And the shader cache's data file is opened with reads shared (an
+// open for writing, a second emulator's, still fails), the render thread's reads of it made through a second,
+// read-only handle: a synchronous handle's reads are made one at a time, so on one handle the render thread's read
+// waits behind the workers'. Where the platform needs no second handle (Linux: pread takes no lock) the first serves.
+static bool PlanReadOwn() {
+	static const bool own = [] {
+		const char* value = std::getenv("KYTY_PLAN_READ");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	return own;
+}
+// (KYTY_PLAN_READ=1: the data file's handle and the render thread's own handle on it; 0 none.)
+static std::atomic<uint64_t> g_plan_data_file {0}, g_plan_reader {0};
+
 // A plan's bytes written (any thread: the file's end reserved atomically).
 static bool SpillPlanBytes(const ShaderRecompiler::IR::ResourcePlan& plan, SpilledPlan& out) {
 	static std::once_flag        once;
@@ -459,11 +475,15 @@ static bool SpillPlanBytes(const ShaderRecompiler::IR::ResourcePlan& plan, Spill
 }
 
 // A plan SpillPlanBytes or the shader prefetch wrote (its linear SRT plan left to the caller); false when it cannot be
-// read.
-static bool LoadPlanBytes(const SpilledPlan& in, ShaderRecompiler::IR::ResourcePlan& plan, bool& linear) {
+// read. `own`: the render thread's read, through its own handle where KYTY_PLAN_READ opened one on the plan's file.
+static bool LoadPlanBytes(const SpilledPlan& in, ShaderRecompiler::IR::ResourcePlan& plan, bool& linear,
+                          bool own = false) {
 	std::vector<char>    packed(in.bytes);
 	std::vector<uint8_t> bytes(in.raw);
-	return LocalPlatform::ReadScratchFile(in.file, in.offset, packed.data(), packed.size()) &&
+	const auto           reader = own && in.file != 0 && in.file == g_plan_data_file.load(std::memory_order_acquire)
+	                                  ? g_plan_reader.load(std::memory_order_relaxed)
+	                                  : uint64_t {0};
+	return LocalPlatform::ReadScratchFile(reader != 0 ? reader : in.file, in.offset, packed.data(), packed.size()) &&
 	       ZstdUnpack(packed, bytes.data(), bytes.size()) && ResourcePlanSerial::Load(bytes, plan, &linear);
 }
 
@@ -687,14 +707,18 @@ struct PipelineCache::ProgramCache {
 		}
 		if (!source.plan_out) return;
 		ShaderRecompiler::IR::ResourcePlan plan;
-		if (!TakeLoadedPlan(source, plan)) {
-			PreloadPlans(last_use);
+		// (KYTY_PLAN_READ=1: the source's own read first; the plans around it handed out once it is back and unlisted.)
+		const bool read  = !TakeLoadedPlan(source, plan);
+		const bool first = read && PlanReadOwn();
+		if (read) {
+			if (!first) PreloadPlans(last_use);
 			bool linear = false;
-			if (!LoadPlanBytes(source.plan_spilled, plan, linear) || linear != (source.plan_linear != nullptr))
+			if (!LoadPlanBytes(source.plan_spilled, plan, linear, first) || linear != (source.plan_linear != nullptr))
 				EXIT("a shader's resource plan could not be read back from the scratch file\n");
 		}
 		RestorePlan(source, std::move(plan));
 		plan_reloads++;
+		if (first) PreloadPlans(last_use);
 	}
 
 	// Each flip; every PlanSweepFlips, the plans no use needed for PlanIdleFlips leave memory beyond a budget of RAM/128
@@ -1234,7 +1258,19 @@ struct PipelineCache::ProgramCache {
 		const auto      index_path = PrefetchCachePath(".prefetch.idx");
 		std::error_code error;
 		std::filesystem::create_directories(data_path.parent_path(), error);
-		const auto file = LocalPlatform::OpenDataFile(Common::PathToString(data_path).c_str());
+		// (KYTY_PLAN_READ=1: reads shared, for the render thread's own handle; writes are still this handle's alone.)
+		const auto data_name   = Common::PathToString(data_path);
+		const auto file        = PlanReadOwn() ? LocalPlatform::OpenDataFileSharingReads(data_name.c_str())
+		                                       : LocalPlatform::OpenDataFile(data_name.c_str());
+		const auto open_reader = [&] {
+			if (!PlanReadOwn()) return;
+			const auto reader = LocalPlatform::OpenDataFileReader(data_name.c_str());
+			if (reader == 0) return;
+			g_plan_reader.store(reader, std::memory_order_relaxed);
+			g_plan_data_file.store(file, std::memory_order_release);
+			PipelineCacheLog("Shader plans: the render thread reads {} through its own handle (KYTY_PLAN_READ=1)",
+			                 data_name);
+		};
 		if (file == 0) {
 			PipelineCacheLog("Shader prefetch cache: off ({} could not be opened: another emulator may have it)",
 			                 Common::PathToString(data_path));
@@ -1274,6 +1310,7 @@ struct PipelineCache::ProgramCache {
 				return disk;
 			}
 			disk.file = file;
+			open_reader();
 			disk.enabled.store(true, std::memory_order_relaxed);
 			disk.saved = std::chrono::steady_clock::now();
 			PipelineCacheLog("Shader prefetch cache: {} {}: every program translated and kept", Common::PathToString(index_path),
@@ -1301,6 +1338,7 @@ struct PipelineCache::ProgramCache {
 		// (Not repaired: the file is read but gets no more entries, which the next session would not read past the end.
 		// New bytes go after every byte there: those no entry names are a crashed session's.)
 		disk.file       = file;
+		open_reader();
 		disk.listed_end = data_end;
 		disk.enabled.store(repaired, std::memory_order_relaxed);
 		disk.end.store(data_end, std::memory_order_relaxed);

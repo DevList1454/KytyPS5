@@ -1635,6 +1635,24 @@ uint64_t OpenDataFile(const char* path) {
 	return file == INVALID_HANDLE_VALUE ? 0 : reinterpret_cast<uint64_t>(file);
 }
 
+uint64_t OpenDataFileSharingReads(const char* path) {
+	wchar_t wide[MAX_PATH * 2] {};
+	if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, MAX_PATH * 2) == 0) return 0;
+	// (Reads shared, for OpenDataFileReader's handle; another process opening it to write, a second emulator, fails.)
+	HANDLE file = CreateFileW(wide, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
+	                          FILE_FLAG_RANDOM_ACCESS, nullptr);
+	return file == INVALID_HANDLE_VALUE ? 0 : reinterpret_cast<uint64_t>(file);
+}
+
+uint64_t OpenDataFileReader(const char* path) {
+	wchar_t wide[MAX_PATH * 2] {};
+	if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, MAX_PATH * 2) == 0) return 0;
+	// (Write shared: the file's own handle, OpenDataFileSharingReads's, writes it.)
+	HANDLE file = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+	                          FILE_FLAG_RANDOM_ACCESS, nullptr);
+	return file == INVALID_HANDLE_VALUE ? 0 : reinterpret_cast<uint64_t>(file);
+}
+
 uint64_t ScratchFileSize(uint64_t file) {
 	LARGE_INTEGER size {};
 	return file != 0 && GetFileSizeEx(reinterpret_cast<HANDLE>(file), &size) != 0 ? static_cast<uint64_t>(size.QuadPart)
@@ -2748,6 +2766,14 @@ uint64_t OpenDataFile(const char* path) {
 		return 0;
 	}
 	return static_cast<uint64_t>(fd) + 1;
+}
+
+uint64_t OpenDataFileSharingReads(const char* path) {
+	return OpenDataFile(path);
+}
+
+uint64_t OpenDataFileReader(const char* /*path*/) {
+	return 0; // (pread takes no lock: the file's own descriptor serves every thread)
 }
 
 uint64_t ScratchFileSize(uint64_t file) {

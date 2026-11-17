@@ -154,6 +154,11 @@ uint64_t OpenFileForReading(const char* path);
 // A file kept between sessions (a UTF-8 path), opened or made for ReadScratchFile, WriteScratchFile and
 // CloseScratchFile by this process alone: 0 when it cannot be, or another process has it open (a second emulator).
 uint64_t OpenDataFile(const char* path);
+// KYTY_PLAN_READ: OpenDataFile with reads shared (an open for writing still fails, so a second emulator is kept out as
+// before), and a read-only second handle on such a file, for another thread's reads; 0 where the platform needs none
+// (Linux: pread takes no lock).
+uint64_t OpenDataFileSharingReads(const char* path);
+uint64_t OpenDataFileReader(const char* path);
 // A scratch or data file's size in bytes (0 when unknown), the file cut or extended to `size`, and its written bytes
 // sent to the disk (false when any of them fails).
 uint64_t ScratchFileSize(uint64_t file);
