@@ -412,6 +412,21 @@ bool RenderExecutor::WeaveScratch::Reader::ReadBytes(uint64_t address, uint64_t 
 				return true;
 			}
 		}
+#if !defined(_WIN32)
+		// Linux: Common::GuardedCopy is a pread of /proc/self/mem there, a system call per read under the mmap
+		// lock, and it reads a page a read watcher protected after the test above (stale bytes, where Windows' copy
+		// stops at the fault). So as mode 4's workers read (Spec::WorkerCopy): such a page fails the read
+		// (Spec::WorkerReadable, asked, never probed), and the rest comes from the backing view (live
+		// spec_backing_reads 1, the default; 0: the guarded copy).
+		if (Spec::WorkerReadable(reinterpret_cast<const void*>(address), bytes) != bytes) {
+			std::memset(out, 0, bytes);
+			return false;
+		}
+		static auto& backing_reads = LiveSwitch::Find("spec_backing_reads", 1);
+		if (backing_reads.load(std::memory_order_relaxed) != 0 &&
+		    Libs::LibKernel::Memory::TryReadBackingToHost(address, out, bytes))
+			return true;
+#endif
 		if (Common::GuardedCopy(out, reinterpret_cast<const void*>(address), bytes) == 0) return true;
 	} else if (Libs::LibKernel::Memory::TryReadGpuCleanBackingToHost(address, out, bytes)) {
 		return true;
